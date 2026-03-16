@@ -12,9 +12,7 @@
 
 ## 效果预览
 
-```
-MiniMax-M2.5-highspeed | mwledgerly@develop (+5 -2) | 12k/200k (6%) | med | 72% 15:00
-```
+![preview](preview.png)
 
 ## 安装
 
