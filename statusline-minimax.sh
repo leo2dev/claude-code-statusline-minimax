@@ -1,8 +1,8 @@
 #!/bin/bash
-# Claude Code Status Line - MiniMax Version
-# Features: Model | CWD@Branch | Tokens | Effort | MiniMax Usage
+# Line 1: Model | dir@branch (diff) | dirty_files
+# Line 2: tokens (%) | effort | usage →reset | session_duration
 
-set -f
+set -f  # disable globbing
 
 input=$(cat)
 
@@ -11,7 +11,7 @@ if [ -z "$input" ]; then
     exit 0
 fi
 
-# ANSI colors
+# ANSI colors matching oh-my-posh theme
 blue='\033[38;2;0;153;255m'
 orange='\033[38;2;255;176;85m'
 green='\033[38;2;0;160;0m'
@@ -34,7 +34,13 @@ format_tokens() {
     fi
 }
 
-# Return color based on usage percentage
+# Format number with commas (e.g., 134,938)
+format_commas() {
+    printf "%'d" "$1"
+}
+
+# Return color escape based on usage percentage
+# Usage: usage_color <pct>
 usage_color() {
     local pct=$1
     if [ "$pct" -ge 90 ]; then echo "$red"
@@ -65,8 +71,12 @@ if [ "$size" -gt 0 ]; then
 else
     pct_used=0
 fi
+pct_remain=$(( 100 - pct_used ))
 
-# Config directory
+used_comma=$(format_commas $current)
+remain_comma=$(format_commas $(( size - current )))
+
+# Config directory (respects CLAUDE_CONFIG_DIR override)
 claude_config_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
 
 # Check reasoning effort
@@ -79,97 +89,170 @@ elif [ -f "$settings_path" ]; then
     [ -n "$effort_val" ] && effort_level="$effort_val"
 fi
 
-# ===== Build output =====
-out=""
-out+="${blue}${model_name}${reset}"
+# ===== Detect CC-Switch provider =====
+cc_switch_dir="$HOME/.cc-switch"
+cc_switch_settings="$cc_switch_dir/settings.json"
+cc_switch_db="$cc_switch_dir/cc-switch.db"
+
+provider_name=""
+current_provider_id=""
+if [ -f "$cc_switch_settings" ] && [ -f "$cc_switch_db" ]; then
+    current_provider_id=$(jq -r '.currentProviderClaude // empty' "$cc_switch_settings" 2>/dev/null)
+    if [ -n "$current_provider_id" ]; then
+        provider_name=$(sqlite3 "$cc_switch_db" "SELECT name FROM providers WHERE id='$current_provider_id' AND app_type='claude';" 2>/dev/null)
+    fi
+fi
+
+# ===== Build two-line output =====
+line1=""
+line1+="${blue}${model_name}${reset}"
+# 显示当前 provider 名称
+if [ -n "$provider_name" ]; then
+    line1+=" ${dim}(${provider_name})${reset}"
+fi
 
 # Current working directory
 cwd=$(echo "$input" | jq -r '.cwd // empty')
 if [ -n "$cwd" ]; then
     display_dir="${cwd##*/}"
     git_branch=$(git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null)
-    out+=" ${dim}|${reset} "
-    out+="${cyan}${display_dir}${reset}"
+    line1+=" ${dim}|${reset} "
+    line1+="${cyan}${display_dir}${reset}"
     if [ -n "$git_branch" ]; then
-        out+="${dim}@${reset}${green}${git_branch}${reset}"
+        line1+="${dim}@${reset}${green}${git_branch}${reset}"
         git_stat=$(git -C "${cwd}" diff --numstat 2>/dev/null | awk '{a+=$1; d+=$2} END {if (a+d>0) printf "+%d -%d", a, d}')
-        [ -n "$git_stat" ] && out+=" ${dim}(${reset}${green}${git_stat%%}^{*}$reset ${red}${git_stat##* }${reset}${dim})${reset}"
+        [ -n "$git_stat" ] && line1+=" ${dim}(${reset}${green}${git_stat%% *}${reset} ${red}${git_stat##* }${reset}${dim})${reset}"
+
+        # 未提交文件数（modified + untracked）
+        dirty_count=$(git -C "${cwd}" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$dirty_count" -gt 0 ] 2>/dev/null; then
+            line1+=" ${dim}|${reset} ${yellow}${dirty_count}${dim}f${reset}"
+        fi
     fi
 fi
 
-out+=" ${dim}|${reset} "
-out+="${orange}${used_tokens}/${total_tokens}${reset} ${dim}(${reset}${green}${pct_used}%${reset}${dim})${reset}"
-out+=" ${dim}|${reset} "
+line2=""
+line2+="${orange}${used_tokens}/${total_tokens}${reset} ${dim}(${reset}${green}${pct_used}%${reset}${dim})${reset}"
+line2+=" ${dim}|${reset} "
 case "$effort_level" in
-    low)    out+="${dim}low${reset}" ;;
-    medium) out+="${orange}med${reset}" ;;
-    *)      out+="${green}high${reset}" ;;
+    low)    line2+="${dim}low${reset}" ;;
+    medium) line2+="${orange}med${reset}" ;;
+    *)      line2+="${green}high${reset}" ;;
 esac
 
-# ===== MiniMax API usage =====
-mmax_cache_file="/tmp/claude/statusline-mmax-cache.json"
-mmax_cache_age=60
+# ===== Provider-aware usage =====
+proxy_cache_file="/tmp/claude/statusline-proxy-cache.json"
+proxy_cache_age=60
 mkdir -p /tmp/claude
 
-mmax_needs_refresh=true
-mmax_data=""
+proxy_needs_refresh=true
+proxy_data=""
 
-if [ -f "$mmax_cache_file" ]; then
-    mmax_cache_mtime=$(stat -c %Y "$mmax_cache_file" 2>/dev/null || stat -f %m "$mmax_cache_file" 2>/dev/null)
+if [ -f "$proxy_cache_file" ]; then
+    proxy_cache_mtime=$(stat -c %Y "$proxy_cache_file" 2>/dev/null || stat -f %m "$proxy_cache_file" 2>/dev/null)
     now=$(date +%s)
-    mmax_age=$(( now - mmax_cache_mtime ))
-    if [ "$mmax_age" -lt "$mmax_cache_age" ]; then
-        mmax_needs_refresh=false
+    proxy_age=$(( now - proxy_cache_mtime ))
+    if [ "$proxy_age" -lt "$proxy_cache_age" ]; then
+        proxy_needs_refresh=false
     fi
-    mmax_data=$(cat "$mmax_cache_file" 2>/dev/null)
+    proxy_data=$(cat "$proxy_cache_file" 2>/dev/null)
 fi
 
-if $mmax_needs_refresh; then
-    touch "$mmax_cache_file" 2>/dev/null
-
-    # Get API key from settings.json
-    api_key=""
-    if [ -f "$claude_config_dir/settings.json" ]; then
-        api_key=$(jq -r '.env.ANTHROPIC_AUTH_TOKEN // empty' "$claude_config_dir/settings.json" 2>/dev/null)
-    fi
-
-    if [ -z "$api_key" ] && [ -n "$ANTHROPIC_AUTH_TOKEN" ]; then
-        api_key="$ANTHROPIC_AUTH_TOKEN"
-    fi
-
-    if [ -n "$api_key" ]; then
-        mmax_response=$(curl -s --max-time 10 \
-            -H "Authorization: Bearer $api_key" \
-            -H "Content-Type: application/json" \
-            "https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains" 2>/dev/null)
-        if [ -n "$mmax_response" ] && echo "$mmax_response" | jq -e '.model_remains[0]' >/dev/null 2>&1; then
-            mmax_data="$mmax_response"
-            echo "$mmax_response" > "$mmax_cache_file"
-        fi
-    fi
-fi
-
-if [ -n "$mmax_data" ] && echo "$mmax_data" | jq -e '.model_remains[0]' >/dev/null 2>&1; then
-    total=$(echo "$mmax_data" | jq -r '.model_remains[0].current_interval_total_count // 0')
-    used=$(echo "$mmax_data" | jq -r '.model_remains[0].current_interval_usage_count // 0')
-    end_time=$(echo "$mmax_data" | jq -r '.model_remains[0].end_time // 0')
-
-    if [ "$total" -gt 0 ] 2>/dev/null; then
-        pct_used=$(( used * 100 / total ))
-        mmax_color=$(usage_color "$pct_used")
-
-        # Convert end_time (ms) to hh:mm
-        reset_time=""
-        if [ "$end_time" -gt 0 ] 2>/dev/null; then
-            end_epoch=$(( end_time / 1000 ))
-            reset_time=$(date -r "$end_epoch" +"%H:%M" 2>/dev/null || date -d "@$end_epoch" +"%H:%M" 2>/dev/null)
+case "$provider_name" in
+    Github*)
+        if $proxy_needs_refresh; then
+            touch "$proxy_cache_file" 2>/dev/null
+            proxy_response=$(curl -s --max-time 5 "http://localhost:4141/usage" 2>/dev/null)
+            if [ -n "$proxy_response" ] && echo "$proxy_response" | jq -e '.quota_snapshots.premium_interactions' >/dev/null 2>&1; then
+                proxy_data="$proxy_response"
+                echo "$proxy_response" > "$proxy_cache_file"
+            fi
         fi
 
-        out+=" ${dim}|${reset} "
-        out+="${mmax_color}${pct_used}%${reset}"
-        [ -n "$reset_time" ] && out+=" ${reset_time}${reset}"
+        if [ -n "$proxy_data" ] && echo "$proxy_data" | jq -e '.quota_snapshots.premium_interactions' >/dev/null 2>&1; then
+            pi_total=$(echo "$proxy_data" | jq -r '.quota_snapshots.premium_interactions.entitlement // 0')
+            pi_remain=$(echo "$proxy_data" | jq -r '.quota_snapshots.premium_interactions.quota_remaining // 0')
+            pi_reset=$(echo "$proxy_data" | jq -r '.quota_reset_date // ""')
+
+            if [ "$pi_total" -gt 0 ] 2>/dev/null; then
+                pi_used=$(( pi_total - pi_remain ))
+                pi_pct_used=$(( pi_used * 100 / pi_total ))
+                pi_color=$(usage_color "$pi_pct_used")
+
+                line2+=" ${dim}|${reset} "
+                line2+="${pi_color}${pi_used}/${pi_total}${reset}"
+                [ -n "$pi_reset" ] && line2+=" ${dim}→${pi_reset}${reset}"
+            fi
+        fi
+        ;;
+    MiniMax*)
+        if $proxy_needs_refresh; then
+            touch "$proxy_cache_file" 2>/dev/null
+            api_key=$(sqlite3 "$cc_switch_db" "SELECT json_extract(settings_config, '\$.env.ANTHROPIC_AUTH_TOKEN') FROM providers WHERE id='$current_provider_id' AND app_type='claude';" 2>/dev/null)
+            if [ -n "$api_key" ]; then
+                proxy_response=$(curl -s --max-time 5 "https://www.minimaxi.com/v1/api/openplatform/coding_plan/remains" \
+                    -H "Authorization: Bearer $api_key" \
+                    -H "Content-Type: application/json" 2>/dev/null)
+                if [ -n "$proxy_response" ] && echo "$proxy_response" | jq -e '.model_remains' >/dev/null 2>&1; then
+                    proxy_data="$proxy_response"
+                    echo "$proxy_response" > "$proxy_cache_file"
+                fi
+            fi
+        fi
+
+        if [ -n "$proxy_data" ] && echo "$proxy_data" | jq -e '.model_remains' >/dev/null 2>&1; then
+            mm_total=$(echo "$proxy_data" | jq -r '[.model_remains[] | select(.model_name | startswith("MiniMax-M"))][0].current_interval_total_count // 0')
+            mm_used=$(echo "$proxy_data" | jq -r '[.model_remains[] | select(.model_name | startswith("MiniMax-M"))][0].current_interval_usage_count // 0')
+            mm_remains_ms=$(echo "$proxy_data" | jq -r '[.model_remains[] | select(.model_name | startswith("MiniMax-M"))][0].remains_time // 0')
+
+            if [ "$mm_total" -gt 0 ] 2>/dev/null; then
+                mm_remain=$(( mm_total - mm_used ))
+                mm_pct_used=$(( mm_used * 100 / mm_total ))
+                mm_color=$(usage_color "$mm_pct_used")
+                # remains_time 是毫秒，转换为 h:m 格式
+                mm_remain_secs=$(( mm_remains_ms / 1000 ))
+                mm_h=$(( mm_remain_secs / 3600 ))
+                mm_m=$(( (mm_remain_secs % 3600) / 60 ))
+
+                line2+=" ${dim}|${reset} "
+                line2+="${mm_color}${mm_used}/${mm_total}${reset}"
+                line2+=" ${dim}→${mm_h}h${mm_m}m${reset}"
+            fi
+        fi
+        ;;
+    # 其他 provider 暂不显示用量，后续扩展
+esac
+
+# ===== 会话时长 =====
+session_start_file="/tmp/claude/session-start.txt"
+if [ -f "$session_start_file" ]; then
+    session_start=$(cat "$session_start_file" 2>/dev/null)
+    now_ts=$(date +%s)
+    if [ -n "$session_start" ] && [ "$session_start" -gt 0 ] 2>/dev/null; then
+        elapsed=$(( now_ts - session_start ))
+        if [ "$elapsed" -ge 3600 ]; then
+            sess_h=$(( elapsed / 3600 ))
+            sess_m=$(( (elapsed % 3600) / 60 ))
+            sess_display="${sess_h}h${sess_m}m"
+        elif [ "$elapsed" -ge 60 ]; then
+            sess_m=$(( elapsed / 60 ))
+            sess_display="${sess_m}m"
+        else
+            sess_display="${elapsed}s"
+        fi
+        # 超过 30 分钟用黄色提示，超过 1 小时用橙色
+        if [ "$elapsed" -ge 3600 ]; then
+            sess_color="$orange"
+        elif [ "$elapsed" -ge 1800 ]; then
+            sess_color="$yellow"
+        else
+            sess_color="$dim"
+        fi
+        line2+=" ${dim}|${reset} ${sess_color}${sess_display}${reset}"
     fi
 fi
 
-printf "%b" "$out"
+# Output two lines
+printf "%b\n%b" "$line1" "$line2"
+
 exit 0
